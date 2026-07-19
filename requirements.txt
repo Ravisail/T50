@@ -1,0 +1,10 @@
+# NIFTY 200 Strategy Scanner - requirements
+# Tested with the versions on the right; minimums keep older installs working.
+
+streamlit>=1.35
+yfinance>=0.2.40      # tested on 1.5.1
+pandas>=2.0
+numpy>=1.26
+plotly>=5.20
+openpyxl>=3.1         # Excel report export
+pyarrow>=14.0         # REQUIRED: parquet cache read/write
