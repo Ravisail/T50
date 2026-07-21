@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-NIFTY 200 Stock Scanner & Backtesting Platform v3.2
+NIFTY 200 Stock Scanner & Backtesting Platform v3.3
 ====================================================
 
 Production-ready Streamlit app with realistic portfolio simulation,
 state-based signal generation, batch data downloads, and comprehensive
 performance metrics.
 
-STRATEGY (v3.2) — RSI Tracking + 200 EMA Trend Confirmation
+STRATEGY (v3.3) — RSI Tracking + EMA Alignment (state-based)
 ------------------------------------------------------------
 A two-phase, state-machine strategy. The RSI event only *arms* tracking;
-the actual entry waits for a trend reclaim above the 200 EMA.
+the actual entry waits for an early reclaim above the 200 EMA while the
+faster EMAs are still below it.
 
   Indicators (every candle): RSI(14), EMA(200), EMA(50), EMA(21)
 
@@ -19,10 +20,15 @@ the actual entry waits for a trend reclaim above the 200 EMA.
        -> set Tracking = TRUE, save the tracking-start date. Do NOT buy.
   2. TRACKING MODE:
        Ignore all further RSI signals. Remain tracking until a valid buy.
-  3. BUY (only while Tracking == TRUE):
-       When on a candle:  Close > EMA(200)  AND  EMA(50) > EMA(21)
+  3. BUY — only while Tracking == TRUE, all FIVE true on one candle:
+       (1) Tracking == True
+       (2) Close   > EMA(200)
+       (3) EMA(50) > EMA(21)
+       (4) EMA(50) < EMA(200)
+       (5) EMA(21) < EMA(200)
+       i.e. structure  Close > EMA200 > EMA50 > EMA21  (early reversal).
        -> generate BUY, execute per the backtest execution model
-          (T+1 open fill), then reset Tracking = FALSE.
+          (T+1 fill), then reset Tracking = FALSE.
 
   Rules enforced:
     - The RSI-trigger candle can NEVER buy (arming only).
@@ -31,6 +37,7 @@ the actual entry waits for a trend reclaim above the 200 EMA.
     - Exactly ONE buy per tracking cycle; a fresh RSI+below-EMA200 event
       is required to arm the next cycle.
     - No repainting: only completed candles, indicators use min_periods.
+    - Scanner, chart signals, and backtest share this one code path.
 
   Portfolio layer (unchanged from prior versions):
     - SELL: price-based profit target (default 3.14%).
@@ -39,7 +46,7 @@ the actual entry waits for a trend reclaim above the 200 EMA.
     - Optional fixed-% Stop Loss mode (mutually exclusive with Averaging).
 
 Author: AI Assistant
-Version: 3.2.0
+Version: 3.3.0
 Python: 3.12+
 """
 
@@ -85,7 +92,7 @@ logging.getLogger('yfinance').setLevel(logging.ERROR)
 # =============================================================================
 
 APP_NAME = "NIFTY 200 Strategy Scanner"
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.4.1"
 APP_ICON = "📈"
 
 CACHE_DIR = Path.home() / ".nifty200_scanner_cache"
@@ -772,7 +779,7 @@ class SignalGenerator:
     @staticmethod
     def generate_signals(df: pd.DataFrame, config: StrategyConfig) -> pd.DataFrame:
         """
-        RSI Tracking + 200 EMA Trend Confirmation — state machine.
+        RSI Tracking + EMA Alignment — state machine.
 
         This strategy is inherently sequential (the state carried from one
         candle to the next decides the meaning of the next candle), so the
@@ -780,8 +787,17 @@ class SignalGenerator:
         not be re-expressed as one: once armed, tracking persists across an
         arbitrary number of candles until the reclaim buy fires.
 
-            NORMAL ──[RSI<thr AND Close<EMA200]──▶ TRACKING ──[Close>EMA200
-                                                             AND EMA50>EMA21]──▶ BUY ─▶ reset ─▶ NORMAL
+            NORMAL ──[RSI<thr AND Close<EMA200]──▶ TRACKING ──▶ BUY ─▶ reset ─▶ NORMAL
+
+        The BUY candle must satisfy ALL FIVE conditions simultaneously:
+            1. Tracking == True
+            2. Close   > EMA200
+            3. EMA50   > EMA21
+            4. EMA50   < EMA200
+            5. EMA21   < EMA200
+        i.e. price has *just* closed back above the 200 EMA while both the
+        50 and 21 EMAs are still below it (early reversal), with the 50
+        still above the 21. Structure:  Close > EMA200 > EMA50 > EMA21.
 
         Guarantees (see module docstring):
           * The arming candle never buys (we `continue` past the buy check).
@@ -837,9 +853,14 @@ class SignalGenerator:
                 continue
 
             # TRACKING state — ignore any further RSI signals; only look for
-            # the reclaim buy: Close > EMA(200) AND EMA(50) > EMA(21).
+            # the reclaim buy. All five conditions must hold on THIS candle:
+            #   Close > EMA200, EMA50 > EMA21, EMA50 < EMA200, EMA21 < EMA200
+            # (Tracking == True is guaranteed by being in this branch.)
             tracking_active[i] = True
-            if (close_v[i] > ema_long_v[i]) and (ema_mid_v[i] > ema_short_v[i]):
+            if (close_v[i] > ema_long_v[i]
+                    and ema_mid_v[i] > ema_short_v[i]
+                    and ema_mid_v[i] < ema_long_v[i]
+                    and ema_short_v[i] < ema_long_v[i]):
                 buy_signal[i] = True
                 tracking = False  # reset — one buy per cycle
 
@@ -852,6 +873,13 @@ class SignalGenerator:
         # Human-readable condition flags (handy for the scanner + debugging).
         df['close_above_ema_long'] = df['close'] > df['ema_long']
         df['ema_mid_gt_short'] = df['ema_mid'] > df['ema_short']
+        df['ema_mid_below_long'] = df['ema_mid'] < df['ema_long']
+        df['ema_short_below_long'] = df['ema_short'] < df['ema_long']
+        # Full early-reversal EMA alignment: Close > EMA200 > EMA50 > EMA21.
+        df['ema_alignment_ok'] = (
+            df['close_above_ema_long'] & df['ema_mid_gt_short']
+            & df['ema_mid_below_long'] & df['ema_short_below_long']
+        )
 
         return df
 
@@ -879,6 +907,7 @@ class SignalGenerator:
             'ema_short': ema_short,   # EMA(21)
             'close_above_ema_long': bool(latest['close_above_ema_long']),
             'ema_mid_gt_short': bool(latest['ema_mid_gt_short']),
+            'ema_alignment_ok': bool(latest['ema_alignment_ok']),
             'tracking_enabled': bool(latest['tracking_active']),
             'tracking_started': bool(latest['tracking_started']),
             'buy_signal': bool(latest['buy_signal']),
@@ -2591,7 +2620,7 @@ def _render_add_position_form(ctx: Dict[str, Any]) -> None:
             )
         c9, c10 = st.columns(2)
         with c9:
-            strategy = st.text_input("Strategy", value="RSI(14)<35 below EMA200 → EMA200 Reclaim", key="pf_form_strategy")
+            strategy = st.text_input("Strategy", value="RSI(14)<35 below EMA200 → Early EMA-Alignment Reclaim", key="pf_form_strategy")
         with c10:
             gap_pct = st.number_input(
                 "Averaging Gap (%)", min_value=0.1, max_value=50.0,
@@ -3656,6 +3685,9 @@ def init_session_state():
         'portfolio_price_cache': {},
         'portfolio_prev_close': {},
         'portfolio_db_ready': False,
+        # Shared OHLC cache so Buy Signal Analysis can reuse data already
+        # downloaded by the Backtest (no re-download when the period matches).
+        'signal_universe_data': {'data': {}, 'period': None},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -3673,9 +3705,11 @@ def render_sidebar():
 
         st.header("Strategy Parameters")
 
-        st.caption("RSI Tracking + 200 EMA Trend Confirmation. Arm on "
-                   "RSI < threshold **and** Close < EMA(long); buy on "
-                   "Close > EMA(long) **and** EMA(mid) > EMA(short).")
+        st.caption("RSI Tracking + EMA Alignment. Arm on RSI < threshold "
+                   "**and** Close < EMA(long); buy on the early reclaim "
+                   "**Close > EMA(long) > EMA(mid) > EMA(short)** "
+                   "(price back above the long EMA while both faster EMAs "
+                   "are still below it, mid above short).")
         rsi_period = st.number_input("RSI Period", min_value=5, max_value=50, value=14, step=1)
         rsi_threshold = st.number_input("RSI Threshold", min_value=10.0, max_value=50.0, value=35.0, step=1.0)
         ema_long = st.number_input("EMA Long (trend filter)", min_value=50, max_value=400, value=200, step=1,
@@ -4200,6 +4234,12 @@ def render_backtest():
                 progress_bar.empty()
                 status_box.empty()
 
+                # Share the freshly downloaded OHLC with the Buy Signal
+                # Analysis page so it doesn't have to re-download.
+                st.session_state['signal_universe_data'] = {
+                    'data': data_dict, 'period': config.data_period
+                }
+
                 # Run optimized portfolio-level backtest
                 engine = BacktestEngine(config)
                 all_trades, daily_equity = engine.run_backtest(data_dict)
@@ -4284,10 +4324,14 @@ def render_backtest():
                 st.warning(
                     "Data is fine, but the strategy conditions never aligned. "
                     f"Arming needs RSI(14) < {config.rsi_threshold:.0f} while "
-                    f"Close is below EMA {config.ema_long}; the buy then needs a "
-                    f"reclaim (Close > EMA {config.ema_long} and EMA {config.ema_mid} "
-                    f"> EMA {config.ema_short}) before any fresh RSI dip. Try "
-                    "raising the RSI threshold or lengthening the data period."
+                    f"Close is below EMA {config.ema_long}; the buy then needs "
+                    f"the early-reclaim alignment "
+                    f"**Close > EMA{config.ema_long} > EMA{config.ema_mid} > "
+                    f"EMA{config.ema_short}** on a single candle. That window is "
+                    "deliberately narrow (price reclaims the long EMA before the "
+                    "faster EMAs cross above it), so zero signals over a short "
+                    "period is common. Try a longer data period or a larger "
+                    "universe."
                 )
             elif executed == 0:
                 st.warning(
@@ -4642,6 +4686,436 @@ def render_statistics():
 # MAIN
 # =============================================================================
 
+# =============================================================================
+# BUY SIGNAL ANALYSIS  (date-range signal counting — reuses SignalGenerator)
+# =============================================================================
+
+def _ordinal(k: int) -> str:
+    """1 -> '1st', 2 -> '2nd', 11 -> '11th', 23 -> '23rd'."""
+    if 10 <= (k % 100) <= 20:
+        suffix = 'th'
+    else:
+        suffix = {1: 'st', 2: 'nd', 3: 'rd'}.get(k % 10, 'th')
+    return f"{k}{suffix}"
+
+
+def _compute_buy_signal_rows(data_dict: Dict[str, pd.DataFrame], config: StrategyConfig,
+                             start_ts: pd.Timestamp, end_ts: pd.Timestamp
+                             ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """Run the SAME SignalGenerator.generate_signals() used by the Scanner and
+    Backtest over every symbol and collect, for the range [start_ts, end_ts]
+    (inclusive): one row per buy_signal candle AND one row per tracking_started
+    candle.
+
+    No new signal logic: buy_signal / tracking_started / rsi / ema_* all come
+    straight from generate_signals(), so counts match the Scanner and Backtest
+    exactly. Each buy is paired with its cycle's arm (the most recent
+    tracking_started at/before the buy) and the symbol's immediately preceding
+    buy (full history). Each tracking-started row is paired with the buy it
+    eventually produced (if any).
+
+    Returns (buy_rows, tracking_rows, stats).
+    """
+    start_ts = pd.Timestamp(start_ts).normalize()
+    end_ts = pd.Timestamp(end_ts).normalize()
+
+    rows: List[Dict[str, Any]] = []
+    tracking_rows: List[Dict[str, Any]] = []
+    stocks_scanned = 0
+    earliest = None
+    latest = None
+
+    for symbol, df in data_dict.items():
+        if df is None or len(df) < config.min_required_bars:
+            continue
+        stocks_scanned += 1
+
+        sig = SignalGenerator.generate_signals(df, config)
+        if 'date' in sig.columns:
+            dates = pd.to_datetime(sig['date']).dt.normalize().to_numpy()
+        else:
+            dates = pd.to_datetime(sig.index).normalize().to_numpy()
+
+        n = len(sig)
+        if n == 0:
+            continue
+        is_buy = sig['buy_signal'].to_numpy()
+        is_arm = (sig['tracking_started'].to_numpy() if 'tracking_started' in sig.columns
+                  else np.zeros(n, dtype=bool))
+        close = sig['close'].to_numpy()
+        rsi = sig['rsi'].to_numpy()
+        ema_s = sig['ema_short'].to_numpy()
+        ema_m = sig['ema_mid'].to_numpy()
+        ema_l = sig['ema_long'].to_numpy()
+
+        d0 = pd.Timestamp(dates[0]); d1 = pd.Timestamp(dates[-1])
+        earliest = d0 if earliest is None else min(earliest, d0)
+        latest = d1 if latest is None else max(latest, d1)
+
+        # Single pass: collect arms, pair each buy with its cycle arm, and
+        # map each arm to the buy it eventually produced (if any).
+        last_arm = None
+        buys: List[Tuple[int, Optional[int]]] = []
+        arms: List[int] = []
+        arm_to_buy: Dict[int, int] = {}
+        for i in range(n):
+            if is_arm[i]:
+                last_arm = i
+                arms.append(i)
+            if is_buy[i]:
+                buys.append((i, last_arm))
+                if last_arm is not None:
+                    arm_to_buy[last_arm] = i
+
+        sym_short = symbol.replace('.NS', '').replace('.BO', '')
+
+        # ---- Buy-signal rows (date in range) ----
+        for seq, (i, arm_idx) in enumerate(buys):
+            bd = pd.Timestamp(dates[i])
+            if not (start_ts <= bd <= end_ts):
+                continue
+            arm_d = pd.Timestamp(dates[arm_idx]) if arm_idx is not None else None
+            days_tracking = int((bd - arm_d).days) if arm_d is not None else None
+            prev_buy_d = pd.Timestamp(dates[buys[seq - 1][0]]) if seq > 0 else None
+            rows.append({
+                'symbol': sym_short,
+                'symbol_full': symbol,
+                'buy_date': bd,
+                'buy_date_str': bd.strftime('%d-%b-%Y'),
+                'close': float(close[i]),
+                'rsi': (float(rsi[i]) if not np.isnan(rsi[i]) else None),
+                'ema21': (float(ema_s[i]) if not np.isnan(ema_s[i]) else None),
+                'ema50': (float(ema_m[i]) if not np.isnan(ema_m[i]) else None),
+                'ema200': (float(ema_l[i]) if not np.isnan(ema_l[i]) else None),
+                'tracking_start_str': (arm_d.strftime('%d-%b-%Y') if arm_d is not None else '—'),
+                'days_in_tracking': days_tracking,
+                'prev_buy_str': (prev_buy_d.strftime('%d-%b-%Y') if prev_buy_d is not None else '—'),
+            })
+
+        # ---- Tracking-started rows (arm date in range) ----
+        for a in arms:
+            ad = pd.Timestamp(dates[a])
+            if not (start_ts <= ad <= end_ts):
+                continue
+            buy_j = arm_to_buy.get(a)
+            buy_d = pd.Timestamp(dates[buy_j]) if buy_j is not None else None
+            tracking_rows.append({
+                'symbol': sym_short,
+                'symbol_full': symbol,
+                'track_date': ad,
+                'track_date_str': ad.strftime('%d-%b-%Y'),
+                'close': float(close[a]),
+                'rsi': (float(rsi[a]) if not np.isnan(rsi[a]) else None),
+                'ema21': (float(ema_s[a]) if not np.isnan(ema_s[a]) else None),
+                'ema50': (float(ema_m[a]) if not np.isnan(ema_m[a]) else None),
+                'ema200': (float(ema_l[a]) if not np.isnan(ema_l[a]) else None),
+                'buy_date': buy_d,
+                'buy_date_str': (buy_d.strftime('%d-%b-%Y') if buy_d is not None else '— (still tracking / no buy)'),
+                'resulted_in_buy': buy_d is not None,
+            })
+
+    # Signal number WITHIN the selected period, per symbol, in date order.
+    rows.sort(key=lambda r: (r['symbol'], r['buy_date']))
+    per_symbol_counter: Dict[str, int] = {}
+    for r in rows:
+        c = per_symbol_counter.get(r['symbol'], 0) + 1
+        per_symbol_counter[r['symbol']] = c
+        r['signal_number'] = c
+
+    tracking_rows.sort(key=lambda r: (r['symbol'], r['track_date']))
+    track_counts: Dict[str, int] = {}
+    for r in tracking_rows:
+        track_counts[r['symbol']] = track_counts.get(r['symbol'], 0) + 1
+
+    stats = {
+        'total_signals': len(rows),
+        'total_tracking_started': len(tracking_rows),
+        'stocks_scanned': stocks_scanned,
+        'stocks_with_signals': len(per_symbol_counter),
+        'stocks_tracking': len(track_counts),
+        'avg_per_stock': (len(rows) / len(per_symbol_counter)) if per_symbol_counter else 0.0,
+        'sym_counts': dict(per_symbol_counter),
+        'track_counts': dict(track_counts),
+        'earliest': earliest,
+        'latest': latest,
+    }
+    return rows, tracking_rows, stats
+
+
+def render_buy_signal_analysis():
+    render_page_header(
+        "Buy Signal Analysis",
+        "Count strategy BUY signals over any custom date range — identical logic to Scanner & Backtest",
+        "target",
+    )
+    config = st.session_state.config
+    store = st.session_state.get('signal_universe_data', {'data': {}, 'period': None})
+    data_dict = store.get('data') or {}
+    active_symbols = st.session_state.get('active_symbols', NIFTY200_SYMBOLS)
+
+    st.caption(f"Universe: **{st.session_state.get('universe_source_label', f'{len(active_symbols)} symbols')}** · "
+               f"Data period: **{config.data_period}** (set in sidebar) · "
+               f"Strategy: RSI(14)&lt;{config.rsi_threshold:.0f} arm → "
+               f"Close&gt;EMA{config.ema_long}&gt;EMA{config.ema_mid}&gt;EMA{config.ema_short} buy")
+
+    # ---------------- Date range + data controls ----------------
+    today = datetime.now().date()
+    default_start = today - timedelta(days=180)
+    c1, c2, c3 = st.columns([1, 1, 1.15])
+    with c1:
+        start_date = st.date_input("Start Date", value=default_start, key="bsa_start")
+    with c2:
+        end_date = st.date_input("End Date", value=today, key="bsa_end")
+    with c3:
+        if data_dict and store.get('period') == config.data_period:
+            st.success(f"Reusing {len(data_dict)} downloaded symbols", icon="✅")
+        elif data_dict:
+            st.warning(f"Cached period '{store.get('period')}' ≠ current '{config.data_period}' — reload to match.",
+                       icon="⚠️")
+        else:
+            st.info("No data loaded yet — click below.", icon="ℹ️")
+        load = st.button("⬇️ Load / Refresh Data", use_container_width=True, key="bsa_load",
+                         help="Reuses on-disk cache (24h TTL); only re-downloads symbols that aren't cached.")
+
+    if load:
+        with st.spinner(f"Loading {len(active_symbols)} symbols (cache reused when fresh)..."):
+            dm = st.session_state.data_manager
+            pb = st.progress(0); sb = st.empty()
+            data_dict = dm.batch_download(
+                active_symbols, period=config.data_period, interval="1d", max_workers=8,
+                progress_callback=lambda p: pb.progress(min(p, 1.0)),
+                status_callback=lambda m: sb.caption(f"📡 {m}"),
+            )
+            pb.empty(); sb.empty()
+            st.session_state['signal_universe_data'] = {'data': data_dict, 'period': config.data_period}
+            store = st.session_state['signal_universe_data']
+
+    if start_date > end_date:
+        st.error("Start Date must be on or before End Date.")
+        return
+    if not data_dict:
+        st.info("Load data to run the analysis. It automatically reuses anything already "
+                "downloaded by the Backtest tab for the same data period.")
+        return
+
+    # ---------------- Compute (reuses SignalGenerator) ----------------
+    with st.spinner("Counting tracking events and buy signals across the universe..."):
+        rows, tracking_rows, stats = _compute_buy_signal_rows(
+            data_dict, config, pd.Timestamp(start_date), pd.Timestamp(end_date)
+        )
+
+    if stats['earliest'] is not None and pd.Timestamp(start_date) < stats['earliest']:
+        st.caption(f"⚠️ Selected start {start_date:%d-%b-%Y} precedes the earliest available data "
+                   f"({stats['earliest']:%d-%b-%Y}). Increase the sidebar Data Period to cover older ranges.")
+
+    # ---------------- Summary metrics ----------------
+    render_section_title("Summary", "bar-chart-2",
+                         badge_text=f"{start_date:%d-%b-%Y} → {end_date:%d-%b-%Y}", badge_class="badge-purple")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    with m1:
+        render_kpi_card("Total Tracking Started", f"{stats['total_tracking_started']}", icon_name="target", accent="amber")
+    with m2:
+        render_kpi_card("Total Buy Signals", f"{stats['total_signals']}", icon_name="zap", accent="purple")
+    with m3:
+        render_kpi_card("Stocks Scanned", f"{stats['stocks_scanned']}", icon_name="layers", accent="blue")
+    with m4:
+        render_kpi_card("Stocks with Signals", f"{stats['stocks_with_signals']}", icon_name="check-circle", accent="green")
+    with m5:
+        render_kpi_card("Avg Signals / Stock", f"{stats['avg_per_stock']:.2f}", icon_name="activity", accent="neutral")
+
+    st.caption(f"Of {stats['total_tracking_started']} tracking cycles started, "
+               f"{stats['total_signals']} produced a buy signal in this range "
+               f"(across {stats['stocks_tracking']} stocks tracking, "
+               f"{stats['stocks_with_signals']} with a buy).")
+
+    if not rows and not tracking_rows:
+        st.info("No tracking events or buy signals were generated in this date range for the loaded universe.")
+        return
+    if not rows:
+        st.info("No buy signals were generated in this date range for the loaded universe.")
+        return
+
+    # ---------------- Filters ----------------
+    render_section_title("Detailed Signals", "list")
+    f1, f2, f3 = st.columns([1.2, 1, 1])
+    with f1:
+        min_sigs = st.number_input("Min buy signals per stock", min_value=1, max_value=50,
+                                   value=1, step=1, key="bsa_min")
+    with f2:
+        st.checkbox("Only stocks with ≥1 signal", value=True, key="bsa_only", disabled=True,
+                    help="Every detailed row is a buy signal, so this is always applied.")
+    with f3:
+        sort_by = st.selectbox("Sort by", ["Signal Date", "Symbol"], key="bsa_sort")
+
+    view = [r for r in rows if stats['sym_counts'].get(r['symbol'], 0) >= min_sigs]
+    if sort_by == "Signal Date":
+        view.sort(key=lambda r: (r['buy_date'], r['symbol']))
+    else:
+        view.sort(key=lambda r: (r['symbol'], r['buy_date']))
+
+    table_rows = [{
+        'symbol': r['symbol'], 'buy_date_str': r['buy_date_str'], 'close': r['close'],
+        'rsi': r['rsi'], 'ema21': r['ema21'], 'ema50': r['ema50'], 'ema200': r['ema200'],
+        'tracking_start_str': r['tracking_start_str'], 'days_in_tracking': r['days_in_tracking'],
+        'signal_ord': _ordinal(r['signal_number']), 'prev_buy_str': r['prev_buy_str'],
+    } for r in view]
+
+    render_premium_table(table_rows, columns=[
+        {'key': 'symbol', 'label': 'Symbol'},
+        {'key': 'buy_date_str', 'label': 'Buy Date'},
+        {'key': 'close', 'label': 'Close', 'fmt': lambda v: f"₹{v:,.2f}"},
+        {'key': 'rsi', 'label': 'RSI', 'fmt': lambda v: (f"{v:.1f}" if v is not None else "—")},
+        {'key': 'ema21', 'label': 'EMA21', 'fmt': lambda v: (f"₹{v:,.2f}" if v is not None else "—")},
+        {'key': 'ema50', 'label': 'EMA50', 'fmt': lambda v: (f"₹{v:,.2f}" if v is not None else "—")},
+        {'key': 'ema200', 'label': 'EMA200', 'fmt': lambda v: (f"₹{v:,.2f}" if v is not None else "—")},
+        {'key': 'tracking_start_str', 'label': 'Tracking Start'},
+        {'key': 'days_in_tracking', 'label': 'Days Tracking', 'fmt': lambda v: (f"{v}" if v is not None else "—")},
+        {'key': 'signal_ord', 'label': 'Signal #'},
+        {'key': 'prev_buy_str', 'label': 'Prev Buy'},
+    ], height=460)
+
+    st.caption(f"Showing {len(view)} of {stats['total_signals']} signals"
+               + (f" · filtered to stocks with ≥{min_sigs} signals" if min_sigs > 1 else ""))
+
+    # ---------------- Charts (from the filtered view) ----------------
+    render_section_title("Signal Distribution", "trending-up")
+    df_v = pd.DataFrame(view)
+    df_v['buy_date'] = pd.to_datetime(df_v['buy_date'])
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        mth = df_v.groupby(df_v['buy_date'].dt.to_period('M')).size()
+        mfig = go.Figure(go.Bar(x=[str(p) for p in mth.index], y=list(mth.values), marker_color='#8B5CF6'))
+        mfig.update_layout(title="Buy Signals per Month")
+        render_chart_card(apply_plotly_theme(mfig, height=300), key="bsa_month")
+    with cc2:
+        wk = df_v.groupby(df_v['buy_date'].dt.to_period('W')).size()
+        wfig = go.Figure(go.Bar(x=[p.start_time.strftime('%d-%b') for p in wk.index],
+                                y=list(wk.values), marker_color='#3B82F6'))
+        wfig.update_layout(title="Buy Signals per Week (week starting)")
+        render_chart_card(apply_plotly_theme(wfig, height=300), key="bsa_week")
+
+    cc3, cc4 = st.columns(2)
+    with cc3:
+        bs = df_v.groupby('symbol').size().sort_values(ascending=False).head(20)
+        bfig = go.Figure(go.Bar(x=list(bs.values), y=list(bs.index), orientation='h', marker_color='#10B981'))
+        bfig.update_layout(title="Buy Signals by Stock (Top 20)", yaxis=dict(autorange="reversed"))
+        render_chart_card(apply_plotly_theme(bfig, height=430), key="bsa_stock")
+    with cc4:
+        daily = df_v.groupby(df_v['buy_date'].dt.normalize()).size()
+        dfig = go.Figure(go.Scatter(x=list(daily.index), y=list(daily.values), mode='lines+markers',
+                                    line=dict(color='#F59E0B', width=2), marker=dict(size=5)))
+        dfig.update_layout(title="Daily Buy Signal Frequency")
+        render_chart_card(apply_plotly_theme(dfig, height=430), key="bsa_daily")
+
+    # ---------------- Tracking Started (detail) ----------------
+    with st.expander(f"🎯 Tracking Started events in range ({stats['total_tracking_started']})", expanded=False):
+        if tracking_rows:
+            tview = sorted(tracking_rows, key=lambda r: (r['track_date'], r['symbol']))
+            render_premium_table([{
+                'symbol': r['symbol'], 'track_date_str': r['track_date_str'],
+                'rsi': r['rsi'], 'close': r['close'], 'ema21': r['ema21'],
+                'ema50': r['ema50'], 'ema200': r['ema200'], 'buy_date_str': r['buy_date_str'],
+            } for r in tview], columns=[
+                {'key': 'symbol', 'label': 'Symbol'},
+                {'key': 'track_date_str', 'label': 'Tracking Start (Signal Date)'},
+                {'key': 'rsi', 'label': 'RSI', 'fmt': lambda v: (f"{v:.1f}" if v is not None else "—")},
+                {'key': 'close', 'label': 'Close', 'fmt': lambda v: f"₹{v:,.2f}"},
+                {'key': 'ema21', 'label': 'EMA21', 'fmt': lambda v: (f"₹{v:,.2f}" if v is not None else "—")},
+                {'key': 'ema50', 'label': 'EMA50', 'fmt': lambda v: (f"₹{v:,.2f}" if v is not None else "—")},
+                {'key': 'ema200', 'label': 'EMA200', 'fmt': lambda v: (f"₹{v:,.2f}" if v is not None else "—")},
+                {'key': 'buy_date_str', 'label': 'Resulting Buy'},
+            ], height=360)
+        else:
+            st.info("No tracking-started events in this date range.")
+
+    # ---------------- Export ----------------
+    render_section_title("Export", "refresh-cw")
+
+    # Buy-signals detail (as shown in the table above)
+    export_df = pd.DataFrame([{
+        'Symbol': r['symbol'], 'Buy Signal Date': r['buy_date_str'], 'Close Price': r['close'],
+        'RSI(14)': r['rsi'], 'EMA21': r['ema21'], 'EMA50': r['ema50'], 'EMA200': r['ema200'],
+        'Tracking Start Date': r['tracking_start_str'], 'Days in Tracking': r['days_in_tracking'],
+        'Signal Number': r['signal_number'], 'Previous Buy Date': r['prev_buy_str'],
+    } for r in view])
+
+    # Tracking-started detail (exact column set requested)
+    tracking_df = pd.DataFrame([{
+        'Symbol': r['symbol'], 'Signal Date': r['track_date_str'], 'RSI': r['rsi'],
+        'Close': r['close'], 'EMA21': r['ema21'], 'EMA50': r['ema50'], 'EMA200': r['ema200'],
+        'Tracking Start Date': r['track_date_str'], 'Buy Signal Date': r['buy_date_str'],
+    } for r in sorted(tracking_rows, key=lambda r: (r['track_date'], r['symbol']))])
+
+    # Unified "All Signals": one row per tracking-start AND per buy, sharing the
+    # exact columns requested (Symbol, Signal Date, RSI, Close, EMA21/50/200,
+    # Tracking Start Date, Buy Signal Date) plus a Type flag.
+    all_events = []
+    for r in tracking_rows:
+        all_events.append({
+            'Type': 'TRACKING_START', 'Symbol': r['symbol'], 'Signal Date': r['track_date_str'],
+            'RSI': r['rsi'], 'Close': r['close'], 'EMA21': r['ema21'], 'EMA50': r['ema50'],
+            'EMA200': r['ema200'], 'Tracking Start Date': r['track_date_str'],
+            'Buy Signal Date': (r['buy_date_str'] if r['resulted_in_buy'] else ''),
+            '_sort': r['track_date'],
+        })
+    for r in view:
+        all_events.append({
+            'Type': 'BUY', 'Symbol': r['symbol'], 'Signal Date': r['buy_date_str'],
+            'RSI': r['rsi'], 'Close': r['close'], 'EMA21': r['ema21'], 'EMA50': r['ema50'],
+            'EMA200': r['ema200'], 'Tracking Start Date': r['tracking_start_str'],
+            'Buy Signal Date': r['buy_date_str'], '_sort': r['buy_date'],
+        })
+    all_events.sort(key=lambda x: (x['_sort'], x['Type'], x['Symbol']))
+    all_signals_df = pd.DataFrame(
+        [{k: v for k, v in e.items() if k != '_sort'} for e in all_events]
+    )
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.download_button(
+            "⬇️ Buy Signals CSV", export_df.to_csv(index=False),
+            f"buy_signals_{start_date:%Y%m%d}_{end_date:%Y%m%d}.csv", "text/csv",
+            use_container_width=True, key="bsa_csv",
+        )
+    with e2:
+        st.download_button(
+            "⬇️ All Signals CSV", all_signals_df.to_csv(index=False),
+            f"all_signals_{start_date:%Y%m%d}_{end_date:%Y%m%d}.csv", "text/csv",
+            use_container_width=True, key="bsa_csv_all",
+        )
+    with e3:
+        xbuf = io.BytesIO()
+        with pd.ExcelWriter(xbuf, engine='openpyxl') as writer:
+            all_signals_df.to_excel(writer, sheet_name='All Signals', index=False)
+            export_df.to_excel(writer, sheet_name='Buy Signals', index=False)
+            (tracking_df if not tracking_df.empty
+             else pd.DataFrame(columns=['Symbol', 'Signal Date', 'RSI', 'Close', 'EMA21',
+                                        'EMA50', 'EMA200', 'Tracking Start Date', 'Buy Signal Date'])
+             ).to_excel(writer, sheet_name='Tracking Started', index=False)
+            pd.DataFrame([
+                {'Metric': 'Total Tracking Started', 'Value': stats['total_tracking_started']},
+                {'Metric': 'Total Buy Signals', 'Value': stats['total_signals']},
+                {'Metric': 'Stocks Scanned', 'Value': stats['stocks_scanned']},
+                {'Metric': 'Stocks Tracking', 'Value': stats['stocks_tracking']},
+                {'Metric': 'Stocks with Signals', 'Value': stats['stocks_with_signals']},
+                {'Metric': 'Avg Signals per Stock', 'Value': round(stats['avg_per_stock'], 2)},
+                {'Metric': 'Date Range', 'Value': f"{start_date:%d-%b-%Y} to {end_date:%d-%b-%Y}"},
+            ]).to_excel(writer, sheet_name='Summary', index=False)
+            (pd.Series(stats['sym_counts']).sort_values(ascending=False)
+             .rename_axis('Symbol').reset_index(name='Buy Signals')
+             ).to_excel(writer, sheet_name='Buy Signals by Symbol', index=False)
+            (pd.Series(stats['track_counts']).sort_values(ascending=False)
+             .rename_axis('Symbol').reset_index(name='Tracking Started')
+             ).to_excel(writer, sheet_name='Tracking by Symbol', index=False)
+        st.download_button(
+            "⬇️ Download Excel (all sheets)", xbuf.getvalue(),
+            f"signal_analysis_{start_date:%Y%m%d}_{end_date:%Y%m%d}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True, key="bsa_xlsx",
+        )
+
+
 def main():
     st.set_page_config(
         page_title=f"{APP_NAME} v{APP_VERSION}",
@@ -4663,7 +5137,7 @@ def main():
                             display:flex;align-items:center;justify-content:center;font-size:17px;">📈</div>
                 <div>
                     <div style="font-size:17px;font-weight:700;color:var(--text-primary);line-height:1.1;">{APP_NAME}</div>
-                    <div style="font-size:11px;color:var(--text-muted);">v{APP_VERSION} · Scanner · Backtester · Portfolio</div>
+                    <div style="font-size:11px;color:var(--text-muted);">v{APP_VERSION} · Scanner · Signals · Backtester · Portfolio</div>
                 </div>
             </div>
             <span class="badge badge-purple">{icon('activity', 11)} Live</span>
@@ -4674,7 +5148,7 @@ def main():
 
     tabs = st.tabs([
         "📊 Dashboard", "🔍 Scanner", "💰 My Portfolio", "📈 Backtest",
-        "📋 Trade Log", "📉 Charts", "💼 Portfolio", "📑 Statistics"
+        "🎯 Buy Signals", "📋 Trade Log", "📉 Charts", "💼 Portfolio", "📑 Statistics"
     ])
 
     with tabs[0]:
@@ -4686,12 +5160,14 @@ def main():
     with tabs[3]:
         render_backtest()
     with tabs[4]:
-        render_trade_log()
+        render_buy_signal_analysis()
     with tabs[5]:
-        render_charts()
+        render_trade_log()
     with tabs[6]:
-        render_portfolio()
+        render_charts()
     with tabs[7]:
+        render_portfolio()
+    with tabs[8]:
         render_statistics()
 
 
